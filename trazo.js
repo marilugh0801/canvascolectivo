@@ -18,6 +18,15 @@
     var lastPinchTime = null
     var isPinching = false
 
+    // Memoria de trazos
+    var strokes = []
+    var redoStrokes = [] // trazos deshechos para rehacer
+    var currentStroke = []
+
+    // Timers de gestos
+    var lastVTime = null
+    var openHandStartTime = null // cuando empezó el gesto de mano abierta
+
     // Canvas encima del video para el esqueleto
     var overlayCanvas = document.createElement('canvas')
     overlayCanvas.width = 320
@@ -46,6 +55,24 @@
     statusLabel.textContent = 'Esperando mano...'
     document.body.appendChild(statusLabel)
 
+    // Aviso de confirmación para borrar todo
+    var confirmLabel = document.createElement('div')
+    confirmLabel.style.position = 'fixed'
+    confirmLabel.style.top = '50%'
+    confirmLabel.style.left = '50%'
+    confirmLabel.style.transform = 'translate(-50%, -50%)'
+    confirmLabel.style.fontFamily = 'monospace'
+    confirmLabel.style.fontSize = '24px'
+    confirmLabel.style.color = 'white'
+    confirmLabel.style.background = 'rgba(200,0,0,0.85)'
+    confirmLabel.style.padding = '20px 32px'
+    confirmLabel.style.borderRadius = '12px'
+    confirmLabel.style.zIndex = '2000'
+    confirmLabel.style.display = 'none'
+    confirmLabel.style.textAlign = 'center'
+    confirmLabel.textContent = '⚠️ Mantén la mano abierta\n2 segundos para borrar todo'
+    document.body.appendChild(confirmLabel)
+
     startBtn.addEventListener('click', function() {
     navigator.mediaDevices.getUserMedia({ video: true })
         .then(function(stream) {
@@ -71,8 +98,8 @@
     mpHands.setOptions({
     maxNumHands: 1,
     modelComplexity: 0,
-    minDetectionConfidence: 0.7,
-    minTrackingConfidence: 0.6
+    minDetectionConfidence: 0.5,
+    minTrackingConfidence: 0.4
     })
 
     var connections = [
@@ -115,12 +142,36 @@
     return tip.y < pip.y
     }
 
+    function redrawAllStrokes() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height)
+    for (var s = 0; s < strokes.length; s++) {
+        var stroke = strokes[s]
+        if (stroke.length < 2) continue
+        ctx.beginPath()
+        ctx.moveTo(stroke[0].x, stroke[0].y)
+        for (var p = 1; p < stroke.length; p++) {
+        ctx.lineTo(stroke[p].x, stroke[p].y)
+        }
+        ctx.strokeStyle = 'black'
+        ctx.lineWidth = 4
+        ctx.lineCap = 'round'
+        ctx.lineJoin = 'round'
+        ctx.stroke()
+    }
+    }
+
     mpHands.onResults(function(results) {
 
     if (results.multiHandLandmarks.length === 0) {
+        if (currentStroke.length > 1) {
+        strokes.push(currentStroke)
+        currentStroke = []
+        }
         lastX = null
         lastY = null
         posHistory = []
+        openHandStartTime = null
+        confirmLabel.style.display = 'none'
         octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height)
         statusLabel.textContent = 'Esperando mano...'
         return
@@ -141,25 +192,97 @@
     var ringPip   = landmarks[14]
     var pinkyPip  = landmarks[18]
 
-    // Detectamos pellizco
-    var dx = thumbTip.x - indexTip.x
-    var dy = thumbTip.y - indexTip.y
-    var pinchDistance = Math.sqrt(dx * dx + dy * dy)
-    isPinching = pinchDistance < 0.05
-
-    // Detectamos si solo el índice está extendido
     var indexUp  = isFingerExtended(indexTip, indexPip)
     var middleUp = isFingerExtended(middleTip, middlePip)
     var ringUp   = isFingerExtended(ringTip, ringPip)
     var pinkyUp  = isFingerExtended(pinkyTip, pinkyPip)
+
+    // Gestos
+    var isVGesture       = indexUp && middleUp && !ringUp && !pinkyUp
+    var isThreeFingers   = indexUp && middleUp && ringUp && !pinkyUp
+    var isOpenHand       = indexUp && middleUp && ringUp && pinkyUp
+
+    var dx = thumbTip.x - indexTip.x
+    var dy = thumbTip.y - indexTip.y
+    var pinchDistance = Math.sqrt(dx * dx + dy * dy)
+    isPinching = pinchDistance < 0.05
 
     var onlyIndexUp = indexUp && !middleUp && !ringUp && !pinkyUp
 
     var rawX = (1 - indexTip.x) * canvas.width
     var rawY = indexTip.y * canvas.height
 
+    // Gesto mano abierta — borrar todo con confirmación de 2 segundos
+    if (isOpenHand) {
+        if (openHandStartTime === null) {
+        openHandStartTime = Date.now()
+        }
+        var elapsed = Date.now() - openHandStartTime
+        var remaining = Math.ceil((2000 - elapsed) / 1000)
+        confirmLabel.style.display = 'block'
+        confirmLabel.textContent = '⚠️ Mantén la mano abierta\n' + remaining + ' segundo(s) para borrar todo'
+
+        if (elapsed >= 2000) {
+        // Borramos todo
+        strokes = []
+        redoStrokes = []
+        currentStroke = []
+        ctx.clearRect(0, 0, canvas.width, canvas.height)
+        openHandStartTime = null
+        confirmLabel.style.display = 'none'
+        statusLabel.textContent = 'Tablero borrado'
+        }
+
+        lastX = null
+        lastY = null
+        posHistory = []
+        return
+    } else {
+        // Si deja de abrir la mano cancelamos
+        openHandStartTime = null
+        confirmLabel.style.display = 'none'
+    }
+
+    // Gesto 3 dedos — rehacer
+    if (isThreeFingers) {
+        if (redoStrokes.length > 0) {
+        var strokeToRedo = redoStrokes.pop()
+        strokes.push(strokeToRedo)
+        redrawAllStrokes()
+        statusLabel.textContent = 'Rehaciendo trazo'
+        } else {
+        statusLabel.textContent = 'Nada que rehacer'
+        }
+        lastX = null
+        lastY = null
+        posHistory = []
+        return
+    }
+
+    // Gesto V — borra el último trazo
+    if (isVGesture) {
+        if (lastVTime === null || Date.now() - lastVTime > 1000) {
+        currentStroke = []
+        if (strokes.length > 0) {
+            var removedStroke = strokes.pop()
+            redoStrokes.push(removedStroke) // lo guardamos para poder rehacer
+            redrawAllStrokes()
+        }
+        lastVTime = Date.now()
+        }
+        lastX = null
+        lastY = null
+        posHistory = []
+        statusLabel.textContent = 'Borrando último trazo'
+        return
+    }
+
     // Si está pellizcando pausamos
     if (isPinching) {
+        if (currentStroke.length > 1) {
+        strokes.push(currentStroke)
+        currentStroke = []
+        }
         lastX = null
         lastY = null
         posHistory = []
@@ -177,8 +300,12 @@
         return
     }
 
-    // Si el índice no está solo extendido, no dibuja
+    // Si el índice no está solo extendido no dibuja
     if (!onlyIndexUp) {
+        if (currentStroke.length > 1) {
+        strokes.push(currentStroke)
+        currentStroke = []
+        }
         lastX = null
         lastY = null
         posHistory = []
@@ -187,6 +314,9 @@
     }
 
     statusLabel.textContent = 'Dibujando'
+
+    // Al dibujar limpiamos redoStrokes porque ya no tiene sentido rehacer
+    redoStrokes = []
 
     posHistory.push({ x: rawX, y: rawY })
 
@@ -211,6 +341,17 @@
         ctx.lineWidth = 4
         ctx.lineCap = 'round'
         ctx.stroke()
+
+        var moved = Math.sqrt((x - lastX) * (x - lastX) + (y - lastY) * (y - lastY))
+        if (moved > 3) {
+        currentStroke.push({ x: x, y: y })
+        if (strokes.length === 0 || strokes[strokes.length - 1] !== currentStroke) {
+            strokes.push(currentStroke)
+        }
+        }
+    } else {
+        currentStroke = [{ x: x, y: y }]
+        strokes.push(currentStroke)
     }
 
     lastX = x
